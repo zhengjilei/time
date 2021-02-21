@@ -22,6 +22,7 @@ type Limit float64
 const Inf = Limit(math.MaxFloat64)
 
 // Every converts a minimum time interval between events to a Limit.
+// interval: 每个请求耗时多长？  1/interval(转换成秒) ->  每 s 多少个请求
 func Every(interval time.Duration) Limit {
 	if interval <= 0 {
 		return Inf
@@ -54,13 +55,13 @@ func Every(interval time.Duration) Limit {
 // The methods AllowN, ReserveN, and WaitN consume n tokens.
 type Limiter struct {
 	mu     sync.Mutex
-	limit  Limit
-	burst  int
-	tokens float64
+	limit  Limit   // 限制每秒多少个请求
+	burst  int     // 桶能容纳的token总数，允许突发流量 burst 个请求
+	tokens float64 // 桶中现有的 token 总数
 	// last is the last time the limiter's tokens field was updated
-	last time.Time
+	last time.Time // 上一次 tokens 字段更新的时间戳
 	// lastEvent is the latest time of a rate-limited event (past or future)
-	lastEvent time.Time
+	lastEvent time.Time // 上一次 rate-limit event 发生的时间戳（之前的，也可能是将来的 - 因为 reservation ）
 }
 
 // Limit returns the maximum overall event rate.
@@ -97,6 +98,7 @@ func (lim *Limiter) Allow() bool {
 // AllowN reports whether n events may happen at time now.
 // Use this method if you intend to drop / skip events that exceed the rate limit.
 // Otherwise use Reserve or Wait.
+// 当超出 当前可使用的 token 个数，立即返回 false，不会等待
 func (lim *Limiter) AllowN(now time.Time, n int) bool {
 	return lim.reserveN(now, n, 0).ok
 }
@@ -107,7 +109,7 @@ type Reservation struct {
 	ok        bool
 	lim       *Limiter
 	tokens    int
-	timeToAct time.Time
+	timeToAct time.Time // reserve 成功后，真正执行的时间
 	// This is the Limit at reservation time, it can change later.
 	limit Limit
 }
@@ -119,6 +121,7 @@ func (r *Reservation) OK() bool {
 	return r.ok
 }
 
+// 计算从当前时刻还需要多久才能执行 reservation
 // Delay is shorthand for DelayFrom(time.Now()).
 func (r *Reservation) Delay() time.Duration {
 	return r.DelayFrom(time.Now())
@@ -135,6 +138,7 @@ func (r *Reservation) DelayFrom(now time.Time) time.Duration {
 	if !r.ok {
 		return InfDuration
 	}
+	// 预期拿到 reserved token 的时刻 距离现在的 delay
 	delay := r.timeToAct.Sub(now)
 	if delay < 0 {
 		return 0
@@ -148,6 +152,7 @@ func (r *Reservation) Cancel() {
 	return
 }
 
+// 取消 reservation, （恢复token的值）
 // CancelAt indicates that the reservation holder will not perform the reserved action
 // and reverses the effects of this Reservation on the rate limit as much as possible,
 // considering that other reservations may have already been made.
@@ -159,18 +164,22 @@ func (r *Reservation) CancelAt(now time.Time) {
 	r.lim.mu.Lock()
 	defer r.lim.mu.Unlock()
 
+	// 无限制 or 预订的 token 数量为 0 or ?
 	if r.lim.limit == Inf || r.tokens == 0 || r.timeToAct.Before(now) {
 		return
 	}
 
+	// restore token
 	// calculate tokens to restore
 	// The duration between lim.lastEvent and r.timeToAct tells us how many tokens were reserved
 	// after r was obtained. These tokens should not be restored.
 	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct))
+	// 对于 reserve 成功的，r.lim.lastEvent = r.timeToAct, 所以 restoreToken = r.tokens
 	if restoreTokens <= 0 {
 		return
 	}
 	// advance time to now
+	// 从现在到上一次update token 的时间，bucket现在本应该有的token总数
 	now, _, tokens := r.lim.advance(now)
 	// calculate new number of tokens
 	tokens += restoreTokens
@@ -180,10 +189,10 @@ func (r *Reservation) CancelAt(now time.Time) {
 	// update state
 	r.lim.last = now
 	r.lim.tokens = tokens
-	if r.timeToAct == r.lim.lastEvent {
-		prevEvent := r.timeToAct.Add(r.limit.durationFromTokens(float64(-r.tokens)))
+	if r.timeToAct == r.lim.lastEvent { // reserve 成功
+		prevEvent := r.timeToAct.Add(r.limit.durationFromTokens(float64(-r.tokens))) // 计算上一次event 的时间
 		if !prevEvent.Before(now) {
-			r.lim.lastEvent = prevEvent
+			r.lim.lastEvent = prevEvent // 设置 event 为上一次 event 的时间
 		}
 	}
 
@@ -229,7 +238,7 @@ func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 	limit := lim.limit
 	lim.mu.Unlock()
 
-	if n > burst && limit != Inf {
+	if n > burst && limit != Inf { // 一次性要的 token 大于 bucket 总容量，返回 error
 		return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", n, burst)
 	}
 	// Check if ctx is already cancelled
@@ -241,29 +250,29 @@ func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 	// Determine wait limit
 	now := time.Now()
 	waitLimit := InfDuration
-	if deadline, ok := ctx.Deadline(); ok {
-		waitLimit = deadline.Sub(now)
+	if deadline, ok := ctx.Deadline(); ok { // 有 deadline
+		waitLimit = deadline.Sub(now) // 计算距离 deadline 的时间
 	}
-	// Reserve
-	r := lim.reserveN(now, n, waitLimit)
-	if !r.ok {
+	// Reserve  返回 Reservation
+	r := lim.reserveN(now, n, waitLimit) // 排他锁
+	if !r.ok {                           // reservation 失败
 		return fmt.Errorf("rate: Wait(n=%d) would exceed context deadline", n)
 	}
 	// Wait if necessary
 	delay := r.DelayFrom(now)
-	if delay == 0 {
+	if delay == 0 { // 没有 delay，返回 nil，说明直接拿到 token 成功，不需要 reservation
 		return nil
 	}
-	t := time.NewTimer(delay)
+	t := time.NewTimer(delay) //启动定时器
 	defer t.Stop()
 	select {
-	case <-t.C:
+	case <-t.C: // 时间到了，所需要的 token 应该按照 limit 速率都应该加到 bucket 中了（实际没有任何操作）， 说明 reservation 成功
 		// We can proceed.
 		return nil
-	case <-ctx.Done():
+	case <-ctx.Done(): // context 取消
 		// Context was canceled before we could proceed.  Cancel the
 		// reservation, which may permit other events to proceed sooner.
-		r.Cancel()
+		r.Cancel() // context 先超时，则取消 reservation
 		return ctx.Err()
 	}
 }
@@ -306,11 +315,12 @@ func (lim *Limiter) SetBurstAt(now time.Time, newBurst int) {
 
 // reserveN is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
+//		允许的最大的等待时间
 // reserveN returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
 func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duration) Reservation {
 	lim.mu.Lock()
 
-	if lim.limit == Inf {
+	if lim.limit == Inf { // 无限制
 		lim.mu.Unlock()
 		return Reservation{
 			ok:        true,
@@ -320,19 +330,24 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 		}
 	}
 
+	// 传入: now 时间戳
+	// now: 当前时间戳
+	// last: 上一次update token的时间戳
+	// tokens: 从上一次 update token 到现在，此时 桶里应该有的 token 总数（算上这段 gap 应该添加的 token 数量 ）
 	now, last, tokens := lim.advance(now)
 
 	// Calculate the remaining number of tokens resulting from the request.
-	tokens -= float64(n)
+	tokens -= float64(n) // 拿去 n 个 token，剩余的 token 数量
 
 	// Calculate the wait duration
 	var waitDuration time.Duration
-	if tokens < 0 {
-		waitDuration = lim.limit.durationFromTokens(-tokens)
+	if tokens < 0 { // 桶内不够 n 个 token, 得到的负数（缺的 token 数量）
+		waitDuration = lim.limit.durationFromTokens(-tokens) // 根据缺的 token 数量计算得到 需要等待的时间
 	}
 
 	// Decide result
 	ok := n <= lim.burst && waitDuration <= maxFutureReserve
+	// 如果 1.n <= 桶内最大容量 且 2. 真实需要等待的时间 比 最大需要等待的时间 相等或更短 => 说明 reserve 成功
 
 	// Prepare reservation
 	r := Reservation{
@@ -342,15 +357,16 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 	}
 	if ok {
 		r.tokens = n
-		r.timeToAct = now.Add(waitDuration)
+		r.timeToAct = now.Add(waitDuration) // 预期可以拿到所有需要的 token 的时刻
 	}
 
 	// Update state
 	if ok {
 		lim.last = now
 		lim.tokens = tokens
-		lim.lastEvent = r.timeToAct
+		lim.lastEvent = r.timeToAct // 最近一次 event 的时刻（可能是之后发生）
 	} else {
+		// reserve 不成功，last 保持不变
 		lim.last = last
 	}
 
@@ -358,6 +374,7 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 	return r
 }
 
+// advance: 预付款，返回 当前时间戳，上一次update token的时间戳，以及 从上一次添加到现在，此时 bucket 里应该有的 token 总数（算上这段 gap 应该添加的 token 数量 ）
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
@@ -367,23 +384,31 @@ func (lim *Limiter) advance(now time.Time) (newNow time.Time, newLast time.Time,
 		last = now
 	}
 
-	// Avoid making delta overflow below when last is very old.
-	maxElapsed := lim.limit.durationFromTokens(float64(lim.burst) - lim.tokens)
-	elapsed := now.Sub(last)
+	// Avoid making delta overflow below when last is very old. 避免因为 last 太小，导致 now - last 的 delta(差值)溢出
+	maxElapsed := lim.limit.durationFromTokens(float64(lim.burst) - lim.tokens) // 要填满 bucket，还需要的时间(ns)
+	elapsed := now.Sub(last)                                                    // 当前距离上一次token变化的间隔
 	if elapsed > maxElapsed {
-		elapsed = maxElapsed
+		elapsed = maxElapsed // 如果距离上一次token 变化的间隔 比填满 bucket 需要的时间(maxElapsed)还长， 直接取 maxElapsed 即可，更长的时间没有意义，桶已经满了
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
+
+	// 根据 elapsed 时间，按照添加token的速率，得到需要添加的 token 数量
 	delta := lim.limit.tokensFromDuration(elapsed)
+
+	// 为什么像上面这么算需要添加的 token 总数？
+	// 如果直接拿 now.Sub(last) * lim.limit  （在过去的时间间隔内 按照速率 limit 添加token，这段时间应该加的 token），由于 last 距离现在可能过大，这样可能会溢出
+
 	tokens := lim.tokens + delta
 	if burst := float64(lim.burst); tokens > burst {
+		// 如果当前已有的 token 总数 + 要添加的 token 总数 超过 bucket的总容量 ，则 总 token 设置为 burst，保证不超过bucket 的总容量
 		tokens = burst
 	}
 
 	return now, last, tokens
 }
 
+// token / limit (每1s产生的token数量)  -> 产生这么多 token 需要的时间(秒), 返回的单位是 ns
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
 // of time it takes to accumulate them at a rate of limit tokens per second.
 func (limit Limit) durationFromTokens(tokens float64) time.Duration {
@@ -391,9 +416,13 @@ func (limit Limit) durationFromTokens(tokens float64) time.Duration {
 	return time.Nanosecond * time.Duration(1e9*seconds)
 }
 
+// limit (每1s产生的 token数量) * time (多少秒) -> 这么长时间能产生的 token 总数
 // tokensFromDuration is a unit conversion function from a time duration to the number of tokens
 // which could be accumulated during that duration at a rate of limit tokens per second.
 func (limit Limit) tokensFromDuration(d time.Duration) float64 {
+	// Refer: https://go-review.googlesource.com/c/time/+/200900/6/rate/rate.go#b390
+	//	return d.Seconds() * float64(limit)
+
 	// Split the integer and fractional parts ourself to minimize rounding errors.
 	// See golang.org/issues/34861.
 	sec := float64(d/time.Second) * float64(limit)
